@@ -1,27 +1,26 @@
 import express,{Request,Response} from 'express';
 import  ytdl  from 'ytdl-core';
+import { fileURLToPath } from 'url';
 import ffmpeg from 'fluent-ffmpeg';
 import fs from 'fs';
 import path from 'path';
 import ffmpegPath from 'ffmpeg-static';
-import {formatTime } from './utilities/helpers.js';
+import {formatTime ,calculateDuration} from './utilities/helpers.js';
 import {ExtendedChapter} from './types.js';
 import _ from 'lodash';
+import youtubedl from 'youtube-dl-exec';
+import { Readable } from 'stream';
 
 let router = express.Router();
-
-if (typeof ffmpegPath === 'string') {
-    ffmpeg.setFfmpegPath(ffmpegPath);
-  } else {
-    console.error('Error: ffmpeg-static did not return a valid path.');
-  }
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 
 router.post('/fetchDetails', async (req: Request, res: Response):Promise<void> => {
     const { url } = req.body;
     try {
         const info = await ytdl.getInfo(url);
-        const description = info.videoDetails;
+        // const description = info.videoDetails;
         // const timestamps = extractTimestamps(description);
 
         let videoLengthSeconds:number = Number(info.videoDetails.lengthSeconds);
@@ -38,7 +37,7 @@ router.post('/fetchDetails', async (req: Request, res: Response):Promise<void> =
     }
 
     let videoLengthFormatted = formatTime(videoLengthSeconds, isHourFormat);
-        res.status(200).json({ success: true, data : {description} });
+        res.status(200).json({ success: true, data : {videoLengthFormatted ,videoLengthSeconds ,chapters} });
     } catch (error) {
        res.status(500).json({ success: false, error: 'Error fetching video information.' });
     }
@@ -46,106 +45,138 @@ router.post('/fetchDetails', async (req: Request, res: Response):Promise<void> =
 
 router.post('/downloadVideo', async (req: Request, res: Response): Promise<void> => {
     try {
-      const { url, timestamps } = req.body;
-      if (!url) {
-        res.status(400).json({ success: false, error: 'URL is required.' });
-        return;
-      }
+      const { url, start_time, end_time } = req.body;
+
+    if (!url || !ytdl.validateURL(url)) {
+      res.status(400).json({ success: false, error: 'Please enter a valid YouTube URL' });
+      return;
+    }
   
       const info = await ytdl.getInfo(url);
-      const videoTitle = info.videoDetails.title.replace(/[^a-zA-Z0-9]/g, '_');
-      const format = 'mp4';
-  
-      // Set headers before starting the stream
-      res.header('Content-Disposition', `attachment; filename="${videoTitle}.${format}"`);
-      res.header('Content-Type', `video/${format}`);
-  
-      // Define videoStream with error handling for 410 status
-      const videoStream = ytdl(url, {
-        quality: '136',
-        highWaterMark: 32 * 1024 * 1024,
-        requestOptions: {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
-          }
-        }
-      });
-  
-      // Handle stream errors separately
-      videoStream.on('error', (err) => {
-        console.error('Stream error:', err);
-        if (!res.headersSent) {
-          res.status(500).json({ success: false, error: 'Video is restricted or unavailable.' });
-        }
-      });
-  
-      if (!_.isEmpty(timestamps)) {
-        // Process the video with ffmpeg using start and end times
-        ffmpeg(videoStream)
-          .setStartTime(parseInt(timestamps.startTime))
-          .setDuration(parseInt(timestamps.endTime) - parseInt(timestamps.startTime))
-          .format(format)
-          .on('error', (err) => {
-            console.error('Error during trimming:', err);
-            if (!res.headersSent) {
-              res.status(500).send('Error trimming the video.');
-            }
-          })
-          .on('end', () => {
-            console.log('Video trimming completed');
-          })
-          .pipe(res, { end: true });
+      const title = info.videoDetails.videoId;
+      const filePath = path.resolve(__dirname, `${title}.mp4`);
+      const chunks: Buffer[] = [];
+      const timeSection = `${start_time}-${end_time}`;
+
+      if (typeof ffmpegPath === 'string') {
+        
+        ffmpeg.setFfmpegPath(ffmpegPath);
       } else {
-        // Direct download without trimming
-        ffmpeg(videoStream)
-          .format(format)
-          .on('error', (err) => {
-            console.error('Error during conversion:', err);
-            if (!res.headersSent) {
-              res.status(500).send('Error converting video.');
+        console.error('Error: ffmpeg-static did not return a valid path.');
+      }
+
+      const ffmpegBinaryPath = ffmpegPath as unknown as string;
+      const youtubeDlProcess = youtubedl.exec(url, {
+        output: '-',
+        format: 'best',
+       downloadSections:`*${timeSection}`,
+       ffmpegLocation : ffmpegBinaryPath
+      });
+      
+      youtubeDlProcess.stdout?.on('data', (chunk) => chunks.push(chunk));
+      youtubeDlProcess.stdout?.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        const stream = Readable.from(buffer);
+
+        const ffmpegCommand = ffmpeg(stream).toFormat('mp4');
+
+      //   if (start_time) ffmpegCommand.setStartTime(start_time);
+      // if (end_time) ffmpegCommand.setDuration(calculateDuration(start_time, end_time));
+
+      ffmpegCommand
+        .save(filePath)
+        .on('end', () => {
+          res.download(filePath, `${title}.mp4`, (err) => {
+            if (err) {
+              console.error("Error sending file:", err);
+              res.status(500).send("Error downloading file");
             }
-          })
-          .on('end', () => {
-            console.log('Video download completed');
-          })
-          .pipe(res, { end: true });
-      }
-    } catch (error) {
-      if (!res.headersSent) {
-        res.status(500).json({ success: false, error: 'Error downloading video.' });
-      }
+            // Delete the file after sending it
+            res.on('close', () => {
+              try {
+                fs.unlinkSync(filePath);
+                console.log("File deleted successfully");
+              } catch (error) {
+                console.error("Error deleting file:", error);
+              }
+            });
+          });
+        })
+        .on("error", (err) => {
+          console.error("FFmpeg error:", err);
+          res.status(500).send("Error processing video");
+        });
+    });
+  } catch (error) {
+    if (!res.headersSent) {
+      console.error(error);
+      res.status(500).json({ success: false, error });
     }
-  });
+  }
+});
 
   router.post('/downloadAudio', async (req: Request, res: Response): Promise<void> => {
     try {
       const { url } = req.body;
-      if (!url) {
-        res.status(400).json({ success: false, error: 'URL is required.' });
+      if (!url && ytdl.validateURL(url)) {
+        res.status(400).json({ success: false, error: 'Please enter a valid YouTube URL' });
         return;
       }
   
       const info = await ytdl.getInfo(url);
 
-      const title = info.videoDetails.title.replace(/[^\w\s]/gi, '');
+      const title = info.videoDetails.videoId;
+      const filePath = path.resolve(__dirname, `${title}.mp3`);
+      const chunks: Buffer[] = [];
+      const youtubeDlProcess = youtubedl.exec(url, {
+        output: '-',
+        format: 'bestaudio',
+      });
+  
+      // Collect the data in chunks
+      youtubeDlProcess.stdout?.on('data', (chunk) => chunks.push(chunk));
+      youtubeDlProcess.stdout?.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        const stream = Readable.from(buffer);
+      if (typeof ffmpegPath === 'string') {
+        ffmpeg.setFfmpegPath(ffmpegPath);
+      } else {
+        console.error('Error: ffmpeg-static did not return a valid path.');
+      }
 
-      console.log(`Downloading audio: ${title}`);
-    
-      // Audio stream
-      const audioStream = ytdl(url, { quality: 'highestaudio' });
-    
-      // Use ffmpeg to convert audio to mp3
-      ffmpeg(audioStream)
+      ffmpeg(stream)
         .audioBitrate(128)
-        .save(`${title}_audio.mp3`)
-        .on('end', () => {
-          console.log(`Audio downloaded: ${title}_audio.mp3`);
+        .audioCodec('libmp3lame')
+        .audioFrequency(44100)
+        .audioChannels(2)
+        .toFormat('mp3')
+        .save(filePath)
+        .on("end", () => {
+          res.download(filePath, `${title}.mp3`, (err) => {
+            if (err) {
+              console.error("Error downloading file:", err);
+              res.status(500).send("Error downloading file");
+            }
+            res.on('close', () => {
+              try {
+                fs.unlinkSync(filePath);
+                console.log("File deleted successfully");
+              } catch (error) {
+                console.error("Error deleting file:", error);
+              }
+            });
+          });
+        })
+        .on("error", (err) => {
+          console.error("FFmpeg error:", err);
+          res.status(500).send("Error processing audio");
         });
-      res.status(200).send("ok");
+      });
+      // res.status(200).json({ success: true, info });
     } catch (error) {    
       if (!res.headersSent) {
         console.error(error);
-        res.status(500).json({ success: false, error: 'Error downloading audio.' });
+        res.status(500).json({ success: false, error: error});
       }
     }   
     });
